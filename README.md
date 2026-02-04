@@ -1,4 +1,4 @@
-# EnergyGrid Data Aggregator
+# Solar Grid Telemetry
 
 This is a client application designed to fetch, aggregate, and report telemetry data from the EnergyGrid Mock API. It focuses on handling strict rate limits and network instability gracefully.
 
