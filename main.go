@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
@@ -18,16 +19,24 @@ import (
 
 // Configuration constants
 const (
-	apiBaseURL  = "http://localhost:3000"
-	apiEndpoint = "/device/real/query"
-	token       = "interview_token_123"
-	batchSize   = 10
-	// 1050ms allows a safe buffer over the 1s strict limit to account for network latency
+	apiBaseURL   = "http://localhost:3000"
+	apiEndpoint  = "/device/real/query"
+	defaultToken = "interview_token_123"
+	batchSize    = 10
+	// 1050ms allows a safe buffer over the 1s strict limit
 	rateLimit    = 1050 * time.Millisecond
 	maxRetries   = 3
 	retryDelay   = 2 * time.Second
 	totalDevices = 500
 )
+
+// getToken reads the API token from environment or falls back to default
+func getToken() string {
+	if token := os.Getenv("ENERGYGRID_TOKEN"); token != "" {
+		return token
+	}
+	return defaultToken
+}
 
 // Server response structures
 
@@ -87,9 +96,8 @@ func parsePower(p string) float64 {
 	return 0.0
 }
 
-// fetchBatch queries the API for a chunk of devices
-func fetchBatch(client *http.Client, batch []string) ([]DeviceData, error) {
-	// Standard unix millis timestamp
+// fetchBatch queries the API for a chunk of devices with context support
+func fetchBatch(ctx context.Context, client *http.Client, batch []string, token string) ([]DeviceData, error) {
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 	sig := generateSignature(apiEndpoint, token, ts)
 
@@ -98,7 +106,7 @@ func fetchBatch(client *http.Client, batch []string) ([]DeviceData, error) {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", apiBaseURL+apiEndpoint, bytes.NewBuffer(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", apiBaseURL+apiEndpoint, bytes.NewBuffer(payload))
 	if err != nil {
 		return nil, fmt.Errorf("new request: %w", err)
 	}
@@ -127,7 +135,6 @@ func fetchBatch(client *http.Client, batch []string) ([]DeviceData, error) {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 
-	// Transform raw response to clean types
 	devices := make([]DeviceData, 0, len(apiResp.Data))
 	for _, raw := range apiResp.Data {
 		parsedTime, _ := time.Parse(time.RFC3339, raw.LastUpdated)
@@ -143,7 +150,9 @@ func fetchBatch(client *http.Client, batch []string) ([]DeviceData, error) {
 }
 
 // processQueue handles the concurrent fetching with strict rate limiting
-func processQueue(serials []string) *AggregatedReport {
+func processQueue(ctx context.Context, serials []string) *AggregatedReport {
+	token := getToken()
+
 	type Job struct {
 		ID    int
 		Batch []string
@@ -181,12 +190,18 @@ func processQueue(serials []string) *AggregatedReport {
 		ticker := time.NewTicker(rateLimit)
 		defer ticker.Stop()
 
-		// Force immediate first execution
 		first := true
 
 		for job := range jobs {
-			// Wait for the next tick to ensure we don't exceed rate limit
-			// Skip wait only for the very first batch
+			// Check for context cancellation
+			select {
+			case <-ctx.Done():
+				results <- Result{Error: ctx.Err(), Batch: job.Batch}
+				continue
+			default:
+			}
+
+			// Rate limit (skip first)
 			if !first {
 				<-ticker.C
 			}
@@ -197,15 +212,13 @@ func processQueue(serials []string) *AggregatedReport {
 			var devices []DeviceData
 			var err error
 
-			// Retry loop
 			for i := 0; i < maxRetries; i++ {
-				devices, err = fetchBatch(client, job.Batch)
+				devices, err = fetchBatch(ctx, client, job.Batch, token)
 				if err == nil {
 					break
 				}
 
 				log.Printf("Batch %d retry %d/%d: %v", job.ID, i+1, maxRetries, err)
-				// Backoff before retry
 				time.Sleep(retryDelay * time.Duration(i+1))
 			}
 
@@ -213,13 +226,11 @@ func processQueue(serials []string) *AggregatedReport {
 		}
 	}()
 
-	// Closer routine
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Aggregation
 	report := &AggregatedReport{
 		TotalDevices: len(serials),
 		DeviceData:   make([]DeviceData, 0, len(serials)),
@@ -255,8 +266,10 @@ func main() {
 		log.Fatalf("Bad URL config: %v", err)
 	}
 
+	ctx := context.Background()
+
 	start := time.Now()
-	report := processQueue(generateSerialNumbers())
+	report := processQueue(ctx, generateSerialNumbers())
 	elapsed := time.Since(start)
 
 	log.Println("\n=== Final Report ===")

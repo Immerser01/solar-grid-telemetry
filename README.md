@@ -1,54 +1,73 @@
 # EnergyGrid Data Aggregator
 
-This is a robust client application to fetch, aggregate, and report telemetry data from the EnergyGrid Mock API, adhering to strict rate limits and security protocols.
+This is a client application designed to fetch, aggregate, and report telemetry data from the EnergyGrid Mock API. It focuses on handling strict rate limits and network instability gracefully.
 
 ## Prerequisites
 
 - **Go** (1.18 or higher)
-- **Node.js** (v14 or higher) for the mock server
+- **Node.js** (v14 or higher) - Required only for the mock server
 
-## Setup and Run
+## Getting Started
 
-### 1. Start the Mock Server
+### 1. Start the Server
 
-The mock server simulates the EnergyGrid API with strict rate limits (1 req/sec).
+The mock server simulates the API behavior, including the 1 req/sec rate limit.
 
 ```bash
 # Install dependencies
 npm install
 
-# Start the server
+# Start the server (keep this terminal running)
 node server.js
 ```
-*Keep this terminal open.*
 
-### 2. Run the Aggregator Client
+### 2. Run the Client
 
-Open a new terminal window and run the Go application:
+In a separate terminal, run the aggregator:
 
 ```bash
 go run main.go
 ```
 
-## Implementation Details
+The application will process 500 devices in batches of 10. You should see progress logs appearing roughly once per second.
 
-### Approach
+### Configuration
 
-The solution uses a **Producer-Consumer (Worker)** pattern to handle concurrency and strict rate limiting efficiently.
+You can override the default API token using environment variables if needed:
 
-- **Queue System**: A buffered channel (`jobs`) holds batches of serial numbers.
-- **Worker**: A single worker goroutine consumes jobs from the queue.
-- **Rate Limiting**: A `time.Ticker` is used within the worker to strictly enforce a >1 second delay (`1050ms`) between requests. This is more robust than `time.Sleep` as it guarantees the interval regardless of execution time, preventing drift while adhering to the API contract.
-- **Batching**: Serial numbers are chunked into batches of 10 (API limit) before being sent to the queue.
-- **Security**: The `Signature` header is dynamically generated for each request using `MD5(URL Path + Token + Timestamp)`.
+```bash
+export ENERGYGRID_TOKEN="your_custom_token"
+go run main.go
+```
+
+## Running Tests
+
+Unit tests are included for the core logic (signature generation, response parsing, and ID generation).
+
+Run them with:
+```bash
+go test -v
+```
+
+## How It Works
+
+### Concurrency & Rate Limiting
+Instead of spawning 500 concurrent requests (which would immediately get rate-limited), I used a **Producer-Consumer** pattern:
+
+- **Queue**: A buffered channel holds all 50 batches (500 serial numbers).
+- **Worker**: A single worker reads from this queue.
+- **Ticker**: A `time.Ticker` set to `1050ms` ensures we respect the 1 request/second limit. I added logic to fire the first request immediately, so we don't waste time waiting at startup.
 
 ### Robustness
+- **Context Handling**: The API client respects `context.Context` for correct timeout handling.
+- **Retries**: If the server returns a `429` (Rate Limit) or a network error, the client retries up to 3 times with exponential backoff.
+- **Fault Tolerance**: A single failed batch is logged but doesn't crash the entire program.
 
-- **Retries**: The client implements an exponential backoff retry mechanism (up to 3 attempts) for handling `429 Too Many Requests` or transient network errors.
-- **Error Handling**: Failed batches are tracked, but they do not stop the aggregation process. The final report distinguishes between successful and failed devices.
+### Security
+Requests are signed using the required MD5 hash of `path + token + timestamp`. I verify this logic in `main_test.go` against a known MD5 hash to ensure correctness.
 
 ## Output
 
-After execution, the program generates `aggregated_report.json` containing:
-- Summary statistics (Total/Average Power).
-- Detailed telemetry for all 500 devices.
+The final report is saved to `aggregated_report.json` and includes:
+- Aggregated stats (Total Power, Success/Fail counts).
+- A complete list of device telemetry.
