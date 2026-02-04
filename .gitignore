@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+
+# Build artifacts
+*.exe
+*.test
+main
+
+# Generated reports
+aggregated_report.json
